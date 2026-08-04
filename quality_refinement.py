@@ -8,8 +8,9 @@ from pathlib import Path
 from typing import Any
 
 import cv2
-import pytesseract
 from dateutil import parser as date_parser
+
+from ocr_backends import read_line
 
 DATE_RE = re.compile(
     r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?\s+"
@@ -36,23 +37,6 @@ def _clean_chip(value: str) -> str:
     return value.strip()
 
 
-def _ocr_line(image, box: dict[str, int], lang: str) -> str:
-    x, y, w, h = box["x"], box["y"], box["width"], box["height"]
-    pad_x, pad_y = 8, 5
-    y0, y1 = max(0, y - pad_y), min(image.shape[0], y + h + pad_y)
-    x0, x1 = max(0, x - pad_x), min(image.shape[1], x + w + pad_x)
-    roi = image[y0:y1, x0:x1]
-    if roi.size == 0:
-        return ""
-    roi = cv2.resize(roi, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-    return re.sub(
-        r"\s+", " ",
-        pytesseract.image_to_string(gray, lang=lang, config="--oem 3 --psm 7")
-    ).strip()
-
-
 def _validate_language(*candidates: str) -> tuple[str | None, str | None]:
     for candidate in candidates:
         candidate = (candidate or "").strip()
@@ -68,7 +52,59 @@ def _validate_language(*candidates: str) -> tuple[str | None, str | None]:
     return None, None
 
 
-def refine(data: dict[str, Any], source: Path, lang: str) -> dict[str, Any]:
+def _plausible_header(value: str) -> str | None:
+    value = re.sub(r"\s+", " ", value or "").strip(" |,;:-")
+    if not value or len(value) < 2 or len(value) > 220:
+        return None
+    if value.casefold() in {"group", "type", "language", "series", "characters", "tags"}:
+        return None
+    if not any(ch.isalnum() for ch in value):
+        return None
+    return value
+
+
+def _header_fallback(
+    image,
+    data: dict[str, Any],
+    lang: str,
+    ocr_engine: str,
+) -> tuple[str | None, str | None, str | None]:
+    group_box = data.get("detected_region", {}).get("anchors", {}).get("group")
+    region = data.get("detected_region", {}).get("box")
+    if not group_box or not region:
+        return None, None, None
+
+    x = group_box["x"]
+    right = min(image.shape[1], region["x"] + region["width"])
+    width = max(1, right - x)
+    group_y = group_box["y"]
+
+    # Two adjacent rows directly above Group. Geometry is anchored only after
+    # the label stack has already established the metadata block.
+    title_box = {
+        "x": x,
+        "y": max(0, group_y - 58),
+        "width": width,
+        "height": 28,
+    }
+    creator_box = {
+        "x": x,
+        "y": max(0, group_y - 30),
+        "width": width,
+        "height": 24,
+    }
+    title, _, title_engine = read_line(image, title_box, lang, ocr_engine)
+    creator, _, creator_engine = read_line(image, creator_box, lang, ocr_engine)
+    engine_used = title_engine if title_engine == creator_engine else f"{title_engine}+{creator_engine}"
+    return _plausible_header(title), _plausible_header(creator), engine_used
+
+
+def refine(
+    data: dict[str, Any],
+    source: Path,
+    lang: str,
+    ocr_engine: str = "auto",
+) -> dict[str, Any]:
     if data.get("extraction", {}).get("status") != "complete":
         return data
 
@@ -76,6 +112,7 @@ def refine(data: dict[str, Any], source: Path, lang: str) -> dict[str, Any]:
     fields = data.setdefault("fields", {})
     work = data.setdefault("work", {})
     warnings = data.setdefault("warnings", [])
+    engines_used: set[str] = set()
 
     group = fields.get("group", {})
     group_text = group.get("value") or ""
@@ -121,6 +158,7 @@ def refine(data: dict[str, Any], source: Path, lang: str) -> dict[str, Any]:
     label_box = language.get("label_box")
     detected_box = data.get("detected_region", {}).get("box")
     candidate = ""
+    candidate_confidence = None
     if image is not None and label_box and detected_box:
         crop_box = {
             "x": label_box["x"] + label_box["width"] + 8,
@@ -135,7 +173,10 @@ def refine(data: dict[str, Any], source: Path, lang: str) -> dict[str, Any]:
             ),
             "height": label_box["height"] + 10,
         }
-        candidate = _ocr_line(image, crop_box, lang)
+        candidate, candidate_confidence, engine_used = read_line(
+            image, crop_box, lang, ocr_engine
+        )
+        engines_used.add(engine_used)
 
     validated, validated_raw = _validate_language(candidate, language.get("value") or "")
     if validated:
@@ -143,6 +184,8 @@ def refine(data: dict[str, Any], source: Path, lang: str) -> dict[str, Any]:
             "status": "available",
             "value": validated,
             "raw_text": validated_raw,
+            "ocr_candidate": candidate or None,
+            "ocr_confidence": candidate_confidence,
             "validation": "known-language-or-script",
         })
     else:
@@ -152,13 +195,34 @@ def refine(data: dict[str, Any], source: Path, lang: str) -> dict[str, Any]:
             "value": None,
             "raw_text": original,
             "ocr_candidate": candidate or None,
+            "ocr_confidence": candidate_confidence,
             "validation": "failed",
         })
         if "language_ocr_unreliable" not in warnings:
             warnings.append("language_ocr_unreliable")
 
-    block_confidence = float(data.get("detected_region", {}).get("confidence") or 0.0)
+    # Retry missing title and creator with the selected local OCR backend.
+    if image is not None and (
+        work.get("title", {}).get("status") != "available"
+        or work.get("creator", {}).get("status") != "available"
+    ):
+        title, creator, header_engine = _header_fallback(image, data, lang, ocr_engine)
+        if header_engine:
+            engines_used.update(header_engine.split("+"))
+        if title:
+            work["title"] = {
+                "status": "available",
+                "value": title,
+                "source": "geometry_anchored_header_ocr",
+            }
+        if creator:
+            work["creator"] = {
+                "status": "available",
+                "value": creator,
+                "source": "geometry_anchored_header_ocr",
+            }
 
+    block_confidence = float(data.get("detected_region", {}).get("confidence") or 0.0)
     weighted_checks = [
         (bool(fields.get("group", {}).get("value")), 1.0),
         (bool(fields.get("type", {}).get("value")), 1.0),
@@ -186,15 +250,14 @@ def refine(data: dict[str, Any], source: Path, lang: str) -> dict[str, Any]:
         0.40 * block_confidence + 0.50 * field_confidence + 0.10 * thumb_confidence,
         3,
     )
-    data["extraction"]["refinement"] = "field-cleanup-v2.1"
+    data["extraction"]["refinement"] = "field-cleanup-v2.2"
+    data["extraction"]["requested_ocr_engine"] = ocr_engine
+    data["extraction"]["refinement_ocr_engines_used"] = sorted(engines_used)
 
-    missing = [
-        name for name in ("title", "creator")
-        if work.get(name, {}).get("status") != "available"
-    ]
-    for name in missing:
-        warning = f"{name}_not_detected"
-        if warning not in warnings:
-            warnings.append(warning)
+    for name in ("title", "creator"):
+        if work.get(name, {}).get("status") != "available":
+            warning = f"{name}_not_detected"
+            if warning not in warnings:
+                warnings.append(warning)
 
     return data
