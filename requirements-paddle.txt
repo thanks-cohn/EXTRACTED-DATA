@@ -1,0 +1,6 @@
+# Optional higher-accuracy local OCR backend.
+# Install this in a Python 3.13 virtual environment if PaddlePaddle does not
+# publish a wheel for the newer Python version installed on your system.
+
+paddleocr>=3.5,<4
+paddlepaddle>=3.2,<4
