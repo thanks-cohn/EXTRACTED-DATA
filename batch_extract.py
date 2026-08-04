@@ -19,21 +19,13 @@ import enhanced_detection
 enhanced_detection.install()
 
 from extracted_data import build_failure, extract  # noqa: E402
+from quality_refinement import refine  # noqa: E402
 
 SUPPORTED_EXTENSIONS = {
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".webp",
-    ".bmp",
-    ".tif",
-    ".tiff",
+    ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff",
 }
 
-GENERATED_SUFFIXES = (
-    "-thumbnail",
-    "-extracted-thumbnail",
-)
+GENERATED_SUFFIXES = ("-thumbnail", "-extracted-thumbnail")
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,34 +34,28 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("source", type=Path, help="Image file or directory to process")
     parser.add_argument(
-        "--recursive",
-        action="store_true",
+        "--recursive", action="store_true",
         help="Search the selected directory and all subdirectories",
     )
     parser.add_argument(
-        "--overwrite",
-        action="store_true",
+        "--overwrite", action="store_true",
         help="Replace existing *-EXTRACTED-DATA.json files",
     )
     parser.add_argument(
-        "--ocr-lang",
-        default="eng",
+        "--ocr-lang", default="eng",
         help="Tesseract language string, default: eng",
     )
     thumbnail = parser.add_mutually_exclusive_group()
     thumbnail.add_argument(
-        "--extract-thumbnail",
-        action="store_true",
+        "--extract-thumbnail", action="store_true",
         help="Extract every detected thumbnail beside its source image",
     )
     thumbnail.add_argument(
-        "--no-extract-thumbnail",
-        action="store_true",
+        "--no-extract-thumbnail", action="store_true",
         help="Do not extract thumbnails",
     )
     parser.add_argument(
-        "--non-interactive",
-        action="store_true",
+        "--non-interactive", action="store_true",
         help="Do not ask questions; thumbnail extraction defaults to no",
     )
     return parser.parse_args()
@@ -158,6 +144,7 @@ def main() -> int:
                 interactive=(not args.non_interactive and len(images) == 1),
                 force_thumbnail=thumbnail_policy,
             )
+            data = refine(data, image, args.ocr_lang)
         except Exception as exc:
             data = build_failure(image, exc)
 
@@ -165,7 +152,9 @@ def main() -> int:
         status = data.get("extraction", {}).get("status")
         if status == "complete":
             succeeded += 1
-            print(f"{prefix}  OK -> {written.name}")
+            confidence = data.get("extraction", {}).get("overall_confidence")
+            suffix = f" confidence={confidence}" if confidence is not None else ""
+            print(f"{prefix}  OK{suffix} -> {written.name}")
         else:
             failed += 1
             reason = data.get("extraction", {}).get("reason", "unknown_error")
