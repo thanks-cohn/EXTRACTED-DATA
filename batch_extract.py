@@ -24,7 +24,6 @@ from quality_refinement import refine  # noqa: E402
 SUPPORTED_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff",
 }
-
 GENERATED_SUFFIXES = ("-thumbnail", "-extracted-thumbnail")
 
 
@@ -43,7 +42,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--ocr-lang", default="eng",
-        help="Tesseract language string, default: eng",
+        help="OCR language string, default: eng",
+    )
+    parser.add_argument(
+        "--ocr-engine",
+        choices=("auto", "paddle", "tesseract"),
+        default="auto",
+        help="Refinement OCR backend. auto prefers local PaddleOCR and falls back to Tesseract.",
     )
     thumbnail = parser.add_mutually_exclusive_group()
     thumbnail.add_argument(
@@ -73,10 +78,8 @@ def discover_images(source: Path, recursive: bool) -> list[Path]:
         if not is_source_image(source):
             raise ValueError(f"Unsupported image file: {source}")
         return [source]
-
     if not source.is_dir():
         raise FileNotFoundError(f"Source does not exist: {source}")
-
     iterator = source.rglob("*") if recursive else source.glob("*")
     return sorted(path for path in iterator if is_source_image(path))
 
@@ -112,7 +115,6 @@ def write_result(source: Path, data: dict) -> Path:
 def main() -> int:
     args = parse_args()
     source = args.source.expanduser().resolve()
-
     try:
         images = discover_images(source, args.recursive)
     except Exception as exc:
@@ -124,14 +126,11 @@ def main() -> int:
         return 0
 
     thumbnail_policy = choose_thumbnail_policy(args, len(images))
-    succeeded = 0
-    failed = 0
-    skipped = 0
+    succeeded = failed = skipped = 0
 
     for index, image in enumerate(images, start=1):
         output = image.with_name(f"{image.stem}-EXTRACTED-DATA.json")
         prefix = f"[{index}/{len(images)}] {image}"
-
         if output.exists() and not args.overwrite:
             skipped += 1
             print(f"{prefix}  SKIPPED (JSON already exists)")
@@ -144,7 +143,7 @@ def main() -> int:
                 interactive=(not args.non_interactive and len(images) == 1),
                 force_thumbnail=thumbnail_policy,
             )
-            data = refine(data, image, args.ocr_lang)
+            data = refine(data, image, args.ocr_lang, args.ocr_engine)
         except Exception as exc:
             data = build_failure(image, exc)
 
@@ -153,8 +152,10 @@ def main() -> int:
         if status == "complete":
             succeeded += 1
             confidence = data.get("extraction", {}).get("overall_confidence")
-            suffix = f" confidence={confidence}" if confidence is not None else ""
-            print(f"{prefix}  OK{suffix} -> {written.name}")
+            engines = data.get("extraction", {}).get("refinement_ocr_engines_used", [])
+            engine_note = f" ocr={'+'.join(engines)}" if engines else ""
+            confidence_note = f" confidence={confidence}" if confidence is not None else ""
+            print(f"{prefix}  OK{confidence_note}{engine_note} -> {written.name}")
         else:
             failed += 1
             reason = data.get("extraction", {}).get("reason", "unknown_error")
