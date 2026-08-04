@@ -1,0 +1,12 @@
+# Optional higher-accuracy local OCR backend.
+# PaddlePaddle currently has no Python 3.14 wheel on PyPI. Install this file
+# from a separate Python 3.13 (or 3.12) virtual environment.
+#
+# Example:
+#   python3.13 -m venv .venv-paddle
+#   source .venv-paddle/bin/activate
+#   python -m pip install -r requirements.txt
+#   python -m pip install -r requirements-paddle.txt
+
+paddleocr>=3.5,<4; python_version < "3.14"
+paddlepaddle>=3.2,<4; python_version < "3.14"

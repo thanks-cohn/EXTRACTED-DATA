@@ -19,21 +19,12 @@ import enhanced_detection
 enhanced_detection.install()
 
 from extracted_data import build_failure, extract  # noqa: E402
+from quality_refinement import refine  # noqa: E402
 
 SUPPORTED_EXTENSIONS = {
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".webp",
-    ".bmp",
-    ".tif",
-    ".tiff",
+    ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff",
 }
-
-GENERATED_SUFFIXES = (
-    "-thumbnail",
-    "-extracted-thumbnail",
-)
+GENERATED_SUFFIXES = ("-thumbnail", "-extracted-thumbnail")
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,34 +33,34 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("source", type=Path, help="Image file or directory to process")
     parser.add_argument(
-        "--recursive",
-        action="store_true",
+        "--recursive", action="store_true",
         help="Search the selected directory and all subdirectories",
     )
     parser.add_argument(
-        "--overwrite",
-        action="store_true",
+        "--overwrite", action="store_true",
         help="Replace existing *-EXTRACTED-DATA.json files",
     )
     parser.add_argument(
-        "--ocr-lang",
-        default="eng",
-        help="Tesseract language string, default: eng",
+        "--ocr-lang", default="eng",
+        help="OCR language string, default: eng",
+    )
+    parser.add_argument(
+        "--ocr-engine",
+        choices=("auto", "paddle", "tesseract"),
+        default="auto",
+        help="Refinement OCR backend. auto prefers local PaddleOCR and falls back to Tesseract.",
     )
     thumbnail = parser.add_mutually_exclusive_group()
     thumbnail.add_argument(
-        "--extract-thumbnail",
-        action="store_true",
+        "--extract-thumbnail", action="store_true",
         help="Extract every detected thumbnail beside its source image",
     )
     thumbnail.add_argument(
-        "--no-extract-thumbnail",
-        action="store_true",
+        "--no-extract-thumbnail", action="store_true",
         help="Do not extract thumbnails",
     )
     parser.add_argument(
-        "--non-interactive",
-        action="store_true",
+        "--non-interactive", action="store_true",
         help="Do not ask questions; thumbnail extraction defaults to no",
     )
     return parser.parse_args()
@@ -87,12 +78,20 @@ def discover_images(source: Path, recursive: bool) -> list[Path]:
         if not is_source_image(source):
             raise ValueError(f"Unsupported image file: {source}")
         return [source]
-
     if not source.is_dir():
         raise FileNotFoundError(f"Source does not exist: {source}")
-
     iterator = source.rglob("*") if recursive else source.glob("*")
     return sorted(path for path in iterator if is_source_image(path))
+
+
+def clickable_uri(path: Path) -> str:
+    """Return an absolute file URI that supported terminals can open."""
+    return path.expanduser().resolve().as_uri()
+
+
+def print_clickable_paths(source: Path, output: Path) -> None:
+    print(f"      source: {clickable_uri(source)}")
+    print(f"      json:   {clickable_uri(output)}")
 
 
 def ask_yes_no(prompt: str, default: bool = False) -> bool:
@@ -118,7 +117,10 @@ def write_result(source: Path, data: dict) -> Path:
     data.setdefault("output", {})
     data["output"]["json_filename"] = output.name
     data["output"]["json_path"] = str(output)
+    data["output"]["json_uri"] = clickable_uri(output)
     data["output"]["saved_beside_source_image"] = True
+    data.setdefault("source", {})
+    data["source"]["image_uri"] = clickable_uri(source)
     output.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return output
 
@@ -126,7 +128,6 @@ def write_result(source: Path, data: dict) -> Path:
 def main() -> int:
     args = parse_args()
     source = args.source.expanduser().resolve()
-
     try:
         images = discover_images(source, args.recursive)
     except Exception as exc:
@@ -138,17 +139,15 @@ def main() -> int:
         return 0
 
     thumbnail_policy = choose_thumbnail_policy(args, len(images))
-    succeeded = 0
-    failed = 0
-    skipped = 0
+    succeeded = failed = skipped = 0
 
     for index, image in enumerate(images, start=1):
         output = image.with_name(f"{image.stem}-EXTRACTED-DATA.json")
-        prefix = f"[{index}/{len(images)}] {image}"
-
+        prefix = f"[{index}/{len(images)}] {image.name}"
         if output.exists() and not args.overwrite:
             skipped += 1
             print(f"{prefix}  SKIPPED (JSON already exists)")
+            print_clickable_paths(image, output)
             continue
 
         try:
@@ -158,6 +157,7 @@ def main() -> int:
                 interactive=(not args.non_interactive and len(images) == 1),
                 force_thumbnail=thumbnail_policy,
             )
+            data = refine(data, image, args.ocr_lang, args.ocr_engine)
         except Exception as exc:
             data = build_failure(image, exc)
 
@@ -165,11 +165,16 @@ def main() -> int:
         status = data.get("extraction", {}).get("status")
         if status == "complete":
             succeeded += 1
-            print(f"{prefix}  OK -> {written.name}")
+            confidence = data.get("extraction", {}).get("overall_confidence")
+            engines = data.get("extraction", {}).get("refinement_ocr_engines_used", [])
+            engine_note = f" ocr={'+'.join(engines)}" if engines else ""
+            confidence_note = f" confidence={confidence}" if confidence is not None else ""
+            print(f"{prefix}  OK{confidence_note}{engine_note}")
         else:
             failed += 1
             reason = data.get("extraction", {}).get("reason", "unknown_error")
-            print(f"{prefix}  FAILED ({reason}) -> {written.name}")
+            print(f"{prefix}  FAILED ({reason})")
+        print_clickable_paths(image, written)
 
     print("\nCompleted:")
     print(f"  succeeded: {succeeded}")
