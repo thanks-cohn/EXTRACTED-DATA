@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import difflib
 import re
-from typing import Iterable
+from typing import Any, Iterable
 
 import cv2
 import numpy as np
@@ -15,6 +15,8 @@ from pytesseract import Output
 import extracted_data as engine
 
 LABELS = ("group", "type", "language", "series", "characters", "tags")
+GENDER_SYMBOLS = {"♀": "female", "♂": "male"}
+_ORIGINAL_DETECT_FILLED_CHIPS = engine.detect_filled_chips
 
 
 def _clean(value: str) -> str:
@@ -169,8 +171,6 @@ def panel_delimited_bottom(image: np.ndarray, tags_box: engine.Box, right_edge: 
     gray = cv2.cvtColor(image[start:end, left:right], cv2.COLOR_BGR2GRAY)
     strip_width = max(1, gray.shape[1])
 
-    # Row statistics: white-space means almost no dark pixels; a panel edge
-    # means a long contiguous dark run, not merely scattered text glyphs.
     dark = gray < 72
     nonwhite_fraction = np.mean(gray < 242, axis=1)
     min_gap = max(12, int(round(tags_box.height * 0.8)))
@@ -214,14 +214,107 @@ def panel_delimited_bottom(image: np.ndarray, tags_box: engine.Box, right_edge: 
 
         blank_run = 0
 
-    # Conservative fallback: end shortly after the last contiguous metadata
-    # activity, but never scan deep into the lower half of the screenshot.
     fallback = start + fallback_last_active + 10
     hard_cap = tags_box.y + max(220, tags_box.height * 14)
     return min(height, max(tags_box.bottom + 10, min(fallback, hard_cap)))
+
+
+def _classify_gender_symbol(text: str) -> tuple[str | None, str | None]:
+    for symbol, meaning in GENDER_SYMBOLS.items():
+        if symbol in text:
+            return symbol, meaning
+    return None, None
+
+
+def _detect_chip_symbol(image: np.ndarray, item: dict[str, Any]) -> dict[str, Any] | None:
+    """Read the small symbol at the far right of a tag chip.
+
+    Exact female/male symbols are normalized. When OCR only produces an
+    approximation such as ¢, =, or «, the raw glyph is retained as uncertain
+    data instead of being silently discarded.
+    """
+    raw_text = str(item.get("raw_text") or item.get("value") or "")
+    symbol, meaning = _classify_gender_symbol(raw_text)
+    if symbol:
+        return {
+            "status": "available",
+            "value": symbol,
+            "meaning": meaning,
+            "raw_ocr": symbol,
+            "source": "full_chip_ocr",
+        }
+
+    box_data = item.get("box") or {}
+    try:
+        box = engine.Box(**box_data)
+    except (TypeError, ValueError):
+        return None
+
+    marker_width = min(box.width, max(16, int(round(box.height * 1.15))))
+    left = max(box.x, box.right - marker_width)
+    roi = image[box.y:box.bottom, left:box.right]
+    marker_ocr = ""
+    if roi.size:
+        enlarged = cv2.resize(roi, None, fx=5.0, fy=5.0, interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(enlarged, cv2.COLOR_BGR2GRAY)
+        gray = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(4, 4)).apply(gray)
+        marker_ocr = engine.normalize(
+            pytesseract.image_to_string(
+                gray,
+                config="--oem 3 --psm 10 -c tessedit_char_whitelist=♀♂",
+            )
+        )
+        symbol, meaning = _classify_gender_symbol(marker_ocr)
+        if symbol:
+            return {
+                "status": "available",
+                "value": symbol,
+                "meaning": meaning,
+                "raw_ocr": marker_ocr,
+                "source": "right_edge_symbol_ocr",
+                "box": {
+                    "x": left,
+                    "y": box.y,
+                    "width": box.right - left,
+                    "height": box.height,
+                },
+            }
+
+    trailing = re.search(r"([^\w\s]+)\s*$", raw_text, flags=re.UNICODE)
+    if trailing:
+        raw_symbol = trailing.group(1)
+        return {
+            "status": "uncertain",
+            "value": None,
+            "meaning": None,
+            "raw_ocr": raw_symbol,
+            "source": "trailing_chip_ocr",
+            "box": {
+                "x": left,
+                "y": box.y,
+                "width": box.right - left,
+                "height": box.height,
+            },
+        }
+    return None
+
+
+def detect_filled_chips_with_symbols(
+    image: np.ndarray,
+    search_box: engine.Box,
+    label_right: int,
+    lang: str,
+) -> list[dict[str, Any]]:
+    items = _ORIGINAL_DETECT_FILLED_CHIPS(image, search_box, label_right, lang)
+    for item in items:
+        symbol = _detect_chip_symbol(image, item)
+        if symbol is not None:
+            item["symbol"] = symbol
+    return items
 
 
 def install() -> None:
     engine.canonical_label = fuzzy_canonical_label
     engine.ocr_tokens = adaptive_ocr_tokens
     engine.detect_bottom_from_content = panel_delimited_bottom
+    engine.detect_filled_chips = detect_filled_chips_with_symbols
