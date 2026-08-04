@@ -84,6 +84,16 @@ def discover_images(source: Path, recursive: bool) -> list[Path]:
     return sorted(path for path in iterator if is_source_image(path))
 
 
+def clickable_uri(path: Path) -> str:
+    """Return an absolute file URI that supported terminals can open."""
+    return path.expanduser().resolve().as_uri()
+
+
+def print_clickable_paths(source: Path, output: Path) -> None:
+    print(f"      source: {clickable_uri(source)}")
+    print(f"      json:   {clickable_uri(output)}")
+
+
 def ask_yes_no(prompt: str, default: bool = False) -> bool:
     suffix = "[Y/n]" if default else "[y/N]"
     answer = input(f"{prompt} {suffix}: ").strip().casefold()
@@ -107,7 +117,10 @@ def write_result(source: Path, data: dict) -> Path:
     data.setdefault("output", {})
     data["output"]["json_filename"] = output.name
     data["output"]["json_path"] = str(output)
+    data["output"]["json_uri"] = clickable_uri(output)
     data["output"]["saved_beside_source_image"] = True
+    data.setdefault("source", {})
+    data["source"]["image_uri"] = clickable_uri(source)
     output.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return output
 
@@ -130,10 +143,11 @@ def main() -> int:
 
     for index, image in enumerate(images, start=1):
         output = image.with_name(f"{image.stem}-EXTRACTED-DATA.json")
-        prefix = f"[{index}/{len(images)}] {image}"
+        prefix = f"[{index}/{len(images)}] {image.name}"
         if output.exists() and not args.overwrite:
             skipped += 1
             print(f"{prefix}  SKIPPED (JSON already exists)")
+            print_clickable_paths(image, output)
             continue
 
         try:
@@ -155,11 +169,12 @@ def main() -> int:
             engines = data.get("extraction", {}).get("refinement_ocr_engines_used", [])
             engine_note = f" ocr={'+'.join(engines)}" if engines else ""
             confidence_note = f" confidence={confidence}" if confidence is not None else ""
-            print(f"{prefix}  OK{confidence_note}{engine_note} -> {written.name}")
+            print(f"{prefix}  OK{confidence_note}{engine_note}")
         else:
             failed += 1
             reason = data.get("extraction", {}).get("reason", "unknown_error")
-            print(f"{prefix}  FAILED ({reason}) -> {written.name}")
+            print(f"{prefix}  FAILED ({reason})")
+        print_clickable_paths(image, written)
 
     print("\nCompleted:")
     print(f"  succeeded: {succeeded}")
