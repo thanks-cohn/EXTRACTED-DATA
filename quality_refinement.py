@@ -22,6 +22,12 @@ KNOWN_LANGUAGES = {
     "english", "japanese", "chinese", "korean", "spanish", "french",
     "german", "italian", "portuguese", "russian", "thai", "vietnamese",
 }
+SCRIPT_LANGUAGE_PATTERNS = (
+    (re.compile(r"[\u3040-\u30ff\u4e00-\u9fff]"), "Japanese"),
+    (re.compile(r"[\uac00-\ud7af]"), "Korean"),
+    (re.compile(r"[\u0400-\u04ff]"), "Russian"),
+    (re.compile(r"[\u0e00-\u0e7f]"), "Thai"),
+)
 
 
 def _clean_chip(value: str) -> str:
@@ -47,6 +53,21 @@ def _ocr_line(image, box: dict[str, int], lang: str) -> str:
     ).strip()
 
 
+def _validate_language(*candidates: str) -> tuple[str | None, str | None]:
+    for candidate in candidates:
+        candidate = (candidate or "").strip()
+        if not candidate:
+            continue
+        for pattern, language in SCRIPT_LANGUAGE_PATTERNS:
+            if pattern.search(candidate):
+                return language, candidate
+        latin = re.sub(r"[^A-Za-z ]", " ", candidate)
+        latin = re.sub(r"\s+", " ", latin).strip().casefold()
+        if latin in KNOWN_LANGUAGES:
+            return latin.title(), candidate
+    return None, None
+
+
 def refine(data: dict[str, Any], source: Path, lang: str) -> dict[str, Any]:
     if data.get("extraction", {}).get("status") != "complete":
         return data
@@ -56,7 +77,6 @@ def refine(data: dict[str, Any], source: Path, lang: str) -> dict[str, Any]:
     work = data.setdefault("work", {})
     warnings = data.setdefault("warnings", [])
 
-    # Split a date accidentally captured at the end of Group.
     group = fields.get("group", {})
     group_text = group.get("value") or ""
     match = DATE_RE.search(group_text)
@@ -76,7 +96,6 @@ def refine(data: dict[str, Any], source: Path, lang: str) -> dict[str, Any]:
             "source": "split_from_group_row",
         }
 
-    # Clean chip OCR and reject obvious non-chip debris.
     for field_name in ("characters", "tags"):
         field = fields.get(field_name, {})
         cleaned_items = []
@@ -98,38 +117,84 @@ def refine(data: dict[str, Any], source: Path, lang: str) -> dict[str, Any]:
         field["values"] = [item["value"] for item in cleaned_items]
         field["status"] = "available" if cleaned_items else "absent"
 
-    # Re-OCR the language row from its own enlarged crop, then validate it.
     language = fields.get("language", {})
     label_box = language.get("label_box")
     detected_box = data.get("detected_region", {}).get("box")
+    candidate = ""
     if image is not None and label_box and detected_box:
         crop_box = {
             "x": label_box["x"] + label_box["width"] + 8,
             "y": label_box["y"] - 5,
-            "width": max(1, min(360, detected_box["x"] + detected_box["width"] - (label_box["x"] + label_box["width"] + 8))),
+            "width": max(
+                1,
+                min(
+                    360,
+                    detected_box["x"] + detected_box["width"]
+                    - (label_box["x"] + label_box["width"] + 8),
+                ),
+            ),
             "height": label_box["height"] + 10,
         }
         candidate = _ocr_line(image, crop_box, lang)
-        normalized = re.sub(r"[^A-Za-z ]", "", candidate).strip().casefold()
-        if normalized in KNOWN_LANGUAGES:
-            language.update({"status": "available", "value": normalized.title(), "raw_text": candidate})
-        elif language.get("value") and not re.search(r"[A-Za-z]{4,}", language.get("value", "")):
-            language.update({"status": "uncertain", "value": None})
+
+    validated, validated_raw = _validate_language(candidate, language.get("value") or "")
+    if validated:
+        language.update({
+            "status": "available",
+            "value": validated,
+            "raw_text": validated_raw,
+            "validation": "known-language-or-script",
+        })
+    else:
+        original = language.get("raw_text") or language.get("value")
+        language.update({
+            "status": "uncertain",
+            "value": None,
+            "raw_text": original,
+            "ocr_candidate": candidate or None,
+            "validation": "failed",
+        })
+        if "language_ocr_unreliable" not in warnings:
             warnings.append("language_ocr_unreliable")
 
-    # Confidence now distinguishes block detection from field extraction quality.
     block_confidence = float(data.get("detected_region", {}).get("confidence") or 0.0)
-    checks = []
-    for name in ("group", "type", "series"):
-        checks.append(bool(fields.get(name, {}).get("value")))
-    checks.append(bool(fields.get("characters", {}).get("values")))
-    checks.append(bool(fields.get("tags", {}).get("values")))
-    checks.append(work.get("date", {}).get("status") == "available")
-    field_confidence = sum(checks) / max(1, len(checks))
+
+    weighted_checks = [
+        (bool(fields.get("group", {}).get("value")), 1.0),
+        (bool(fields.get("type", {}).get("value")), 1.0),
+        (fields.get("language", {}).get("status") == "available", 1.0),
+        (bool(fields.get("series", {}).get("value")), 1.0),
+        (bool(fields.get("characters", {}).get("values")), 1.0),
+        (bool(fields.get("tags", {}).get("values")), 1.0),
+        (work.get("date", {}).get("status") == "available", 0.8),
+        (work.get("title", {}).get("status") == "available", 1.2),
+        (work.get("creator", {}).get("status") == "available", 0.8),
+    ]
+    earned = sum(weight for passed, weight in weighted_checks if passed)
+    possible = sum(weight for _, weight in weighted_checks)
+    field_confidence = earned / possible
+
+    thumbnail = data.get("thumbnail", {})
+    thumb_confidence = float(thumbnail.get("confidence") or 0.0)
+    if thumbnail.get("status") != "detected":
+        thumb_confidence = 0.0
+
     data["extraction"]["block_confidence"] = round(block_confidence, 3)
     data["extraction"]["field_confidence"] = round(field_confidence, 3)
+    data["extraction"]["thumbnail_confidence"] = round(thumb_confidence, 3)
     data["extraction"]["overall_confidence"] = round(
-        0.45 * block_confidence + 0.55 * field_confidence, 3
+        0.40 * block_confidence + 0.50 * field_confidence + 0.10 * thumb_confidence,
+        3,
     )
-    data["extraction"]["refinement"] = "field-cleanup-v2"
+    data["extraction"]["refinement"] = "field-cleanup-v2.1"
+
+    missing = [
+        name for name in ("title", "creator")
+        if work.get(name, {}).get("status") != "available"
+    ]
+    for name in missing:
+        warning = f"{name}_not_detected"
+        if warning not in warnings:
+            warnings.append(warning)
+
     return data
