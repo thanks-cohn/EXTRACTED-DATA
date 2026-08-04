@@ -1,0 +1,4 @@
+opencv-python>=4.10,<5
+pytesseract>=0.3.13,<1
+Pillow>=10,<12
+python-dateutil>=2.9,<3
