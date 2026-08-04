@@ -16,6 +16,7 @@ import extracted_data as engine
 
 LABELS = ("group", "type", "language", "series", "characters", "tags")
 GENDER_SYMBOLS = {"♀": "female", "♂": "male"}
+TRAILING_SYMBOL_OCR = {"♀", "♂", "¢", "=", "«", "+", "5", "s"}
 _ORIGINAL_DETECT_FILLED_CHIPS = engine.detect_filled_chips
 
 
@@ -226,13 +227,16 @@ def _classify_gender_symbol(text: str) -> tuple[str | None, str | None]:
     return None, None
 
 
-def _detect_chip_symbol(image: np.ndarray, item: dict[str, Any]) -> dict[str, Any] | None:
-    """Read the small symbol at the far right of a tag chip.
+def _trailing_symbol_candidate(raw_text: str) -> str | None:
+    match = re.search(r"\s+(\S)\s*$", raw_text, flags=re.UNICODE)
+    if not match:
+        return None
+    candidate = match.group(1)
+    return candidate if candidate in TRAILING_SYMBOL_OCR else None
 
-    Exact female/male symbols are normalized. When OCR only produces an
-    approximation such as ¢, =, or «, the raw glyph is retained as uncertain
-    data instead of being silently discarded.
-    """
+
+def _detect_chip_symbol(image: np.ndarray, item: dict[str, Any]) -> dict[str, Any] | None:
+    """Read and preserve the small symbol at the far right of a tag chip."""
     raw_text = str(item.get("raw_text") or item.get("value") or "")
     symbol, meaning = _classify_gender_symbol(raw_text)
     if symbol:
@@ -280,9 +284,8 @@ def _detect_chip_symbol(image: np.ndarray, item: dict[str, Any]) -> dict[str, An
                 },
             }
 
-    trailing = re.search(r"([^\w\s]+)\s*$", raw_text, flags=re.UNICODE)
-    if trailing:
-        raw_symbol = trailing.group(1)
+    raw_symbol = _trailing_symbol_candidate(raw_text)
+    if raw_symbol:
         return {
             "status": "uncertain",
             "value": None,
@@ -307,9 +310,15 @@ def detect_filled_chips_with_symbols(
 ) -> list[dict[str, Any]]:
     items = _ORIGINAL_DETECT_FILLED_CHIPS(image, search_box, label_right, lang)
     for item in items:
+        raw_text = str(item.get("raw_text") or item.get("value") or "")
+        trailing = _trailing_symbol_candidate(raw_text)
         symbol = _detect_chip_symbol(image, item)
         if symbol is not None:
             item["symbol"] = symbol
+        if trailing:
+            clean_value = re.sub(r"\s+\S\s*$", "", raw_text, flags=re.UNICODE).strip()
+            if clean_value:
+                item["value"] = clean_value
     return items
 
 
