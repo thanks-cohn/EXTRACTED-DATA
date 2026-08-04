@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -14,9 +15,10 @@ from ocr_backends import backend_diagnostics, read_line
 
 DATE_RE = re.compile(
     r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?\s+"
-    r"\d{1,2},\s+\d{4}(?:,?\s+\d{1,2}:\d{2}\s*(?:AM|PM))?",
+    r"\d{1,2}(?:,\s+\d{4})?(?:,?\s+\d{1,2}:\d{2}\s*(?:AM|PM))?",
     re.IGNORECASE,
 )
+YEAR_RE = re.compile(r"\b\d{4}\b")
 TRIM_CHARS = " \t\r\n|,;:[](){}<>«»‘’“”€¢=+-_"
 REJECT_CHIPS = {"by", "and", "or", "the"}
 KNOWN_LANGUAGES = {
@@ -63,6 +65,52 @@ def _plausible_header(value: str) -> str | None:
     return value
 
 
+def _reference_datetime(data: dict[str, Any]) -> datetime:
+    processed_at = data.get("extraction", {}).get("processed_at")
+    if processed_at:
+        try:
+            return datetime.fromisoformat(str(processed_at).replace("Z", "+00:00"))
+        except ValueError:
+            pass
+    return datetime.now().astimezone()
+
+
+def _extract_date_from_group(data: dict[str, Any], fields: dict[str, Any], work: dict[str, Any]) -> None:
+    group = fields.get("group", {})
+    group_text = group.get("value") or ""
+    match = DATE_RE.search(group_text)
+    if not match:
+        return
+
+    raw_date = match.group(0).strip()
+    remaining = f"{group_text[:match.start()]} {group_text[match.end():]}"
+    group_value = re.sub(r"\s+", " ", remaining).strip(" ,;:-")
+    group.update({
+        "status": "available" if group_value else "absent",
+        "value": group_value or None,
+        "raw_text": group_value or None,
+    })
+
+    reference = _reference_datetime(data)
+    has_explicit_year = bool(YEAR_RE.search(raw_date))
+    default = reference.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    try:
+        parsed = date_parser.parse(raw_date, default=default)
+        parsed_iso = parsed.isoformat()
+    except (ValueError, OverflowError):
+        parsed_iso = None
+
+    work["date"] = {
+        "status": "available",
+        "raw_text": raw_date,
+        "parsed_iso": parsed_iso,
+        "box": None,
+        "source": "split_from_group_row",
+        "year_inferred": not has_explicit_year,
+        "inferred_year": reference.year if not has_explicit_year else None,
+    }
+
+
 def _header_fallback(image, data: dict[str, Any], lang: str, ocr_engine: str) -> tuple[str | None, str | None, str | None]:
     group_box = data.get("detected_region", {}).get("anchors", {}).get("group")
     region = data.get("detected_region", {}).get("box")
@@ -90,18 +138,7 @@ def refine(data: dict[str, Any], source: Path, lang: str, ocr_engine: str = "aut
     warnings = data.setdefault("warnings", [])
     engines_used: set[str] = set()
 
-    group = fields.get("group", {})
-    group_text = group.get("value") or ""
-    match = DATE_RE.search(group_text)
-    if match:
-        raw_date = match.group(0)
-        group_value = group_text[:match.start()].strip(" ,;:-")
-        group.update({"value": group_value or None, "raw_text": group_value or None})
-        try:
-            parsed_iso = date_parser.parse(raw_date).isoformat()
-        except (ValueError, OverflowError):
-            parsed_iso = None
-        work["date"] = {"status": "available", "raw_text": raw_date, "parsed_iso": parsed_iso, "box": None, "source": "split_from_group_row"}
+    _extract_date_from_group(data, fields, work)
 
     for field_name in ("characters", "tags"):
         field = fields.get(field_name, {})
@@ -182,7 +219,7 @@ def refine(data: dict[str, Any], source: Path, lang: str, ocr_engine: str = "aut
     extraction["field_confidence"] = round(field_confidence, 3)
     extraction["thumbnail_confidence"] = round(thumb_confidence, 3)
     extraction["overall_confidence"] = round(0.40 * block_confidence + 0.50 * field_confidence + 0.10 * thumb_confidence, 3)
-    extraction["refinement"] = "field-cleanup-v2.3"
+    extraction["refinement"] = "field-cleanup-v2.4"
     extraction["requested_ocr_engine"] = ocr_engine
     extraction["refinement_ocr_engines_used"] = sorted(engines_used)
     extraction["ocr_backend_diagnostics"] = backend_diagnostics()
