@@ -13,9 +13,12 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Iterable
 
-from extracted_data import build_failure, extract
+import enhanced_detection
+
+enhanced_detection.install()
+
+from extracted_data import build_failure, extract  # noqa: E402
 
 SUPPORTED_EXTENSIONS = {
     ".png",
@@ -88,7 +91,7 @@ def discover_images(source: Path, recursive: bool) -> list[Path]:
     if not source.is_dir():
         raise FileNotFoundError(f"Source does not exist: {source}")
 
-    iterator: Iterable[Path] = source.rglob("*") if recursive else source.glob("*")
+    iterator = source.rglob("*") if recursive else source.glob("*")
     return sorted(path for path in iterator if is_source_image(path))
 
 
@@ -98,6 +101,16 @@ def ask_yes_no(prompt: str, default: bool = False) -> bool:
     if not answer:
         return default
     return answer in {"y", "yes"}
+
+
+def choose_thumbnail_policy(args: argparse.Namespace, image_count: int) -> bool | None:
+    if args.extract_thumbnail:
+        return True
+    if args.no_extract_thumbnail or args.non_interactive:
+        return False
+    if image_count > 1:
+        return ask_yes_no("Extract thumbnails for all detected images?", default=False)
+    return None
 
 
 def write_result(source: Path, data: dict) -> Path:
@@ -120,33 +133,22 @@ def main() -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
+    print(f"Found {len(images)} image(s).")
     if not images:
-        print("No supported images found.")
-        return 1
+        return 0
 
-    forced_thumbnail: bool | None
-    if args.extract_thumbnail:
-        forced_thumbnail = True
-    elif args.no_extract_thumbnail or args.non_interactive:
-        forced_thumbnail = False
-    elif len(images) > 1:
-        forced_thumbnail = ask_yes_no("Extract thumbnails for all detected images?", default=False)
-    else:
-        forced_thumbnail = None
-
+    thumbnail_policy = choose_thumbnail_policy(args, len(images))
     succeeded = 0
     failed = 0
     skipped = 0
-
-    print(f"Found {len(images)} image(s).")
 
     for index, image in enumerate(images, start=1):
         output = image.with_name(f"{image.stem}-EXTRACTED-DATA.json")
         prefix = f"[{index}/{len(images)}] {image}"
 
         if output.exists() and not args.overwrite:
-            print(f"{prefix}  SKIPPED (JSON already exists)")
             skipped += 1
+            print(f"{prefix}  SKIPPED (JSON already exists)")
             continue
 
         try:
@@ -154,26 +156,26 @@ def main() -> int:
                 image,
                 args.ocr_lang,
                 interactive=(not args.non_interactive and len(images) == 1),
-                force_thumbnail=forced_thumbnail,
+                force_thumbnail=thumbnail_policy,
             )
         except Exception as exc:
             data = build_failure(image, exc)
 
         written = write_result(image, data)
-        if data.get("extraction", {}).get("status") == "complete":
-            print(f"{prefix}  OK -> {written.name}")
+        status = data.get("extraction", {}).get("status")
+        if status == "complete":
             succeeded += 1
+            print(f"{prefix}  OK -> {written.name}")
         else:
-            reason = data.get("extraction", {}).get("reason", "unknown failure")
-            print(f"{prefix}  FAILED ({reason}) -> {written.name}")
             failed += 1
+            reason = data.get("extraction", {}).get("reason", "unknown_error")
+            print(f"{prefix}  FAILED ({reason}) -> {written.name}")
 
     print("\nCompleted:")
     print(f"  succeeded: {succeeded}")
     print(f"  failed:    {failed}")
     print(f"  skipped:   {skipped}")
-
-    return 2 if failed else 0
+    return 0 if failed == 0 else 2
 
 
 if __name__ == "__main__":
