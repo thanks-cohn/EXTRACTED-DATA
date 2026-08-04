@@ -39,7 +39,11 @@ def _prepare_line(roi: np.ndarray) -> np.ndarray:
     return cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
 
 
-def tesseract_line(image: np.ndarray, box: dict[str, int], lang: str) -> tuple[str, float | None]:
+def tesseract_line(
+    image: np.ndarray,
+    box: dict[str, int],
+    lang: str,
+) -> tuple[str, float | None]:
     roi = _prepare_line(_crop(image, box))
     if roi.size == 0:
         return "", None
@@ -50,37 +54,65 @@ def tesseract_line(image: np.ndarray, box: dict[str, int], lang: str) -> tuple[s
 def _paddle_language(lang: str) -> str:
     first = (lang or "eng").split("+")[0].casefold()
     return {
-        "eng": "en", "en": "en", "jpn": "japan", "japanese": "japan",
-        "chi_sim": "ch", "chi_tra": "chinese_cht", "kor": "korean",
+        "eng": "en",
+        "en": "en",
+        "jpn": "japan",
+        "japanese": "japan",
+        "chi_sim": "ch",
+        "chi_tra": "chinese_cht",
+        "kor": "korean",
     }.get(first, "en")
 
 
 @lru_cache(maxsize=8)
 def _paddle_reader(lang: str):
+    """Create a reader compatible with PaddleOCR 3.3.x and newer 3.x releases."""
     _BACKEND_DIAGNOSTICS["paddle_attempted"] = True
     try:
         import paddle  # type: ignore  # noqa: F401
         from paddleocr import PaddleOCR  # type: ignore
 
-        kwargs = {
-            "lang": _paddle_language(lang),
-            "use_doc_orientation_classify": False,
-            "use_doc_unwarping": False,
-            "use_textline_orientation": False,
-            "engine": "paddle",
-        }
-        try:
-            reader = PaddleOCR(**kwargs)
-        except TypeError:
-            kwargs.pop("engine", None)
-            reader = PaddleOCR(**kwargs)
-        _BACKEND_DIAGNOSTICS.update({"paddle_available": True, "paddle_error": None})
-        return reader
+        paddle_lang = _paddle_language(lang)
+        attempts = (
+            {
+                "lang": paddle_lang,
+                "use_doc_orientation_classify": False,
+                "use_doc_unwarping": False,
+                "use_textline_orientation": False,
+            },
+            {
+                "lang": paddle_lang,
+                "use_angle_cls": False,
+                "show_log": False,
+            },
+            {"lang": paddle_lang},
+        )
+
+        last_error: Exception | None = None
+        for kwargs in attempts:
+            try:
+                reader = PaddleOCR(**kwargs)
+                _BACKEND_DIAGNOSTICS.update(
+                    {
+                        "paddle_available": True,
+                        "paddle_error": None,
+                        "paddle_init_kwargs": sorted(kwargs),
+                    }
+                )
+                return reader
+            except (TypeError, ValueError) as exc:
+                last_error = exc
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("paddleocr_initialization_failed")
     except Exception as exc:
-        _BACKEND_DIAGNOSTICS.update({
-            "paddle_available": False,
-            "paddle_error": f"{type(exc).__name__}: {exc}",
-        })
+        _BACKEND_DIAGNOSTICS.update(
+            {
+                "paddle_available": False,
+                "paddle_error": f"{type(exc).__name__}: {exc}",
+            }
+        )
         raise
 
 
@@ -88,12 +120,14 @@ def _walk_paddle_payload(value: Any) -> list[tuple[str, float | None]]:
     found: list[tuple[str, float | None]] = []
     if value is None:
         return found
+
     if hasattr(value, "json"):
         try:
             payload = value.json() if callable(value.json) else value.json
             return _walk_paddle_payload(payload)
         except Exception:
             pass
+
     if isinstance(value, dict):
         texts = value.get("rec_texts") or value.get("texts")
         scores = value.get("rec_scores") or value.get("scores")
@@ -110,11 +144,19 @@ def _walk_paddle_payload(value: Any) -> list[tuple[str, float | None]]:
                         pass
                 found.append((cleaned, score))
             return found
+
         for child in value.values():
             found.extend(_walk_paddle_payload(child))
         return found
+
     if isinstance(value, (list, tuple)):
-        if len(value) == 2 and isinstance(value[1], (list, tuple)) and value[1] and isinstance(value[1][0], str):
+        # PaddleOCR 2.x / compatibility result: [box, (text, score)].
+        if (
+            len(value) == 2
+            and isinstance(value[1], (list, tuple))
+            and value[1]
+            and isinstance(value[1][0], str)
+        ):
             score = None
             if len(value[1]) > 1:
                 try:
@@ -122,23 +164,45 @@ def _walk_paddle_payload(value: Any) -> list[tuple[str, float | None]]:
                 except (TypeError, ValueError):
                     pass
             return [(_normalise(value[1][0]), score)]
+
         for child in value:
             found.extend(_walk_paddle_payload(child))
+
     return found
 
 
-def paddle_line(image: np.ndarray, box: dict[str, int], lang: str) -> tuple[str, float | None]:
+def paddle_line(
+    image: np.ndarray,
+    box: dict[str, int],
+    lang: str,
+) -> tuple[str, float | None]:
     roi = _crop(image, box)
     if roi.size == 0:
         return "", None
+
+    # Give the detector enough pixels for tiny UI text.
+    roi = cv2.resize(roi, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
     reader = _paddle_reader(lang)
-    result = list(reader.predict(roi))
+
+    result: Any = None
+    if hasattr(reader, "predict"):
+        result = list(reader.predict(roi))
+    elif hasattr(reader, "ocr"):
+        try:
+            result = reader.ocr(roi, cls=False)
+        except TypeError:
+            result = reader.ocr(roi)
+    else:
+        raise RuntimeError("paddleocr_reader_has_no_predict_or_ocr")
+
     items = _walk_paddle_payload(result)
     if not items:
         return "", None
+
     text = _normalise(" ".join(text for text, _ in items))
     scores = [score for _, score in items if score is not None]
-    return text, (sum(scores) / len(scores) if scores else None)
+    confidence = sum(scores) / len(scores) if scores else None
+    return text, confidence
 
 
 def backend_diagnostics() -> dict[str, Any]:
@@ -153,7 +217,12 @@ def paddle_available(lang: str = "eng") -> bool:
         return False
 
 
-def read_line(image: np.ndarray, box: dict[str, int], lang: str, engine: str = "auto") -> tuple[str, float | None, str]:
+def read_line(
+    image: np.ndarray,
+    box: dict[str, int],
+    lang: str,
+    engine: str = "auto",
+) -> tuple[str, float | None, str]:
     engine = (engine or "auto").casefold()
     if engine not in {"auto", "paddle", "tesseract"}:
         raise ValueError(f"Unsupported OCR engine: {engine}")
@@ -163,8 +232,11 @@ def read_line(image: np.ndarray, box: dict[str, int], lang: str, engine: str = "
             text, confidence = paddle_line(image, box, lang)
             if text or engine == "paddle":
                 return text, confidence, "paddle"
-            _BACKEND_DIAGNOSTICS["paddle_error"] = "PaddleOCR returned no text for this crop"
-        except Exception:
+            _BACKEND_DIAGNOSTICS["paddle_error"] = (
+                "PaddleOCR returned no text for this crop"
+            )
+        except Exception as exc:
+            _BACKEND_DIAGNOSTICS["paddle_error"] = f"{type(exc).__name__}: {exc}"
             if engine == "paddle":
                 raise
         _BACKEND_DIAGNOSTICS["fallback_to_tesseract"] = True
